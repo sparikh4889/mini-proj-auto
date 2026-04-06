@@ -1,0 +1,325 @@
+# =============================================================================
+#
+#  Stage naming:
+#    layer-00-tools-sub00-parallel    (2+ repos, same sub-stage)
+#    layer-00-tools-sub01-sequential  (1 repo, alone in sub-stage)
+#    layer-01-interfaces-sub00-parallel
+#    ...
+#
+#  Variables:
+#    WINDOW                  0500 | 0900 | 1300
+#    INTRA_LAYER_THRESHOLD_SECONDS  default 120s — gap threshold within a layer
+# =============================================================================
+
+# ── Generate ──────────────────────────────────────────────────────────────────
+generate-layer-yaml:
+  stage: generate
+  tags: [shell]
+  script:
+    - |
+      python3 - <<'PYEOF'
+      import os, json, base64, urllib.request, urllib.error
+      from datetime import datetime, timezone, timedelta
+
+      # ── Config ────────────────────────────────────────────────────────────────
+      window = os.environ.get("WINDOW", "0500")
+      git_group  = os.environ.get("git_GROUP", "")
+      default_branch= os.environ.get("DEFAULT_BRANCH", "main")
+      threshold_s   = int(os.environ.get("INTRA_LAYER_THRESHOLD_SECONDS", "120"))
+
+      def parse_time(ts):
+          return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+      # ── Window boundaries ─────────────────────────────────────────────────────
+      WINDOWS = {
+          "0500": {"prev": "1300", "prev_day": -1},
+          "0900": {"prev": "0500", "prev_day":  0},
+          "1300": {"prev": "0900", "prev_day":  0},
+      }
+      today = datetime.now(timezone.utc).date()
+      cfg   = WINDOWS[window]
+      ph, pm = int(cfg["prev"][:2]), int(cfg["prev"][2:])
+      pd    = today + timedelta(days=cfg["prev_day"])
+      window_start = datetime(pd.year, pd.month, pd.day, ph, pm, 0,
+                              tzinfo=timezone.utc)
+      ch = int(window[:2])
+      window_end = datetime(today.year, today.month, today.day, ch, 0, 0,
+                            tzinfo=timezone.utc)
+
+      manifest_date = today.strftime("%Y%m%d")
+      window_label  = f"{window}-{manifest_date}"
+
+      print(f"Window    : {window_start.isoformat()} -> {window_end.isoformat()}")
+      print(f"Threshold : {threshold_s}s (intra-layer)")
+
+      # ── Fetch + filter manifest ───────────────────────────────────────────────
+      mpath = (f"repository/{manifest_repo}/{manifest_date}"
+               f"/manifest-{manifest_date}.json")
+      all_entries = json.loads(body).get("entries", []) if status == 200 else []
+
+      window_entries = sorted(
+          [e for e in all_entries
+           if window_start <= parse_time(e["publish_time"]) < window_end],
+          key=lambda e: e["publish_time"]
+      )
+      print(f"Entries in window: {len(window_entries)}")
+
+      # Latest entry per repo_name (a repo may publish multiple times per window)
+      entry_map = {}
+      for e in window_entries:
+          entry_map[e["repo_name"]] = e   # sorted asc → last write wins (latest)
+
+      # ── Load layers.yml ───────────────────────────────────────────────────────
+      try:
+          import yaml
+          with open("layers.yml") as f:
+              layer_config = yaml.safe_load(f)
+      except ImportError:
+          # Fallback: minimal YAML parser for simple key:value and lists
+          # (PyYAML is not always available on shell runners)
+          import re
+          with open("layers.yml") as f:
+              raw = f.read()
+          # Use json via a safe subset — in practice install pyyaml on runner
+          raise SystemExit("PyYAML not available. Install: pip3 install pyyaml")
+
+      layers = sorted(layer_config["layers"], key=lambda l: l["order"])
+
+      # ── Intra-layer clustering ────────────────────────────────────────────────
+      def cluster(entries, threshold):
+          """
+          Greedy single-pass clustering by publishTime gap.
+          Returns list of sub-stage lists (each sub-stage = parallel group).
+          Uses last-in-cluster as the gap reference point.
+          """
+          if not entries:
+              return []
+          clusters = []
+          current  = [entries[0]]
+          for entry in entries[1:]:
+              gap = (parse_time(entry["publish_time"])
+                     - parse_time(current[-1]["publish_time"])).total_seconds()
+              if gap <= threshold:
+                  current.append(entry)
+              else:
+                  clusters.append(current)
+                  current = [entry]
+          clusters.append(current)
+          return clusters
+
+      # ── Build stages and jobs ─────────────────────────────────────────────────
+      all_stages        = []
+      all_jobs          = {}   # job_name -> job dict
+      layer_summaries   = []
+
+      for layer in layers:
+          layer_name  = layer["name"]
+          layer_order = layer["order"]
+          layer_repos = layer.get("repos", [])
+
+          # Match manifest entries to this layer's repos
+          matched_entries = []
+          skipped_repos   = []
+
+          for repo_def in layer_repos:
+              rname = repo_def["name"]
+              if rname in entry_map:
+                  matched_entries.append(
+                      (repo_def, entry_map[rname])
+                  )
+              else:
+                  skipped_repos.append(rname)
+
+          if not matched_entries:
+              print(f"\n  Layer '{layer_name}' (order {layer_order}): "
+                    f"no repos in window — layer skipped")
+              layer_summaries.append({
+                  "layer": layer_name, "order": layer_order,
+                  "status": "skipped",
+                  "sub_stages": [], "skipped_repos": skipped_repos
+              })
+              continue
+
+          # Sort matched entries by publishTime for clustering
+          matched_entries.sort(key=lambda x: x[1]["publish_time"])
+
+          # Cluster into sub-stages
+          entries_only = [e for _, e in matched_entries]
+          repo_def_map = {e["repo_name"]: rd for rd, e in matched_entries}
+          sub_clusters = cluster(entries_only, threshold_s)
+
+          print(f"\n  Layer '{layer_name}' (order {layer_order}): "
+                f"{len(matched_entries)} repos -> {len(sub_clusters)} sub-stage(s), "
+                f"{len(skipped_repos)} skipped")
+
+          sub_stage_summaries = []
+          for sub_idx, sub_entries in enumerate(sub_clusters):
+              parallel   = len(sub_entries) > 1
+              mode_label = "parallel" if parallel else "sequential"
+              stage_name = (f"layer-{layer_order:02d}-{layer_name}"
+                            f"-sub{sub_idx:02d}-{mode_label}")
+              all_stages.append(stage_name)
+
+              print(f"    sub{sub_idx:02d} [{mode_label:10}]: "
+                    + ", ".join(
+                        f"{e['repo_name']} ({e['publish_time'][11:19]})"
+                        for e in sub_entries
+                    ))
+
+              sub_repos = []
+              for entry in sub_entries:
+                  rname    = entry["repo_name"]
+                  repo_def = repo_def_map[rname]
+                  safe     = rname.lower().replace("_","-").replace(" ","-")
+                  proj     = repo_def.get("project_path",
+                             f"{git_group}/{rname}")
+                  branch   = entry.get("reference_branch", default_branch)
+
+                  job_name = f"trigger-{safe}"
+                  # Disambiguate if same repo appears in multiple sub-stages
+                  # (shouldn't happen with latest-entry dedup, but be safe)
+                  if job_name in all_jobs:
+                      job_name = f"trigger-{safe}-{layer_order:02d}-{sub_idx:02d}"
+
+                  all_jobs[job_name] = {
+                      "stage":   stage_name,
+                      "trigger": {
+                          "project":  proj,
+                          "branch":   branch,
+                          "strategy": "depend",
+                      },
+                      "rules": [{"when": "always"}],
+                      "_meta": {
+                          "layer":           layer_name,
+                          "sub_stage":       sub_idx,
+                          "build_type":      entry["build_type"],
+                          "publish_version": entry["publish_version"],
+                          "publish_time":    entry["publish_time"],
+                      }
+                  }
+                  sub_repos.append(rname)
+
+              sub_stage_summaries.append({
+                  "sub_stage": sub_idx,
+                  "mode":      mode_label,
+                  "repos":     sub_repos,
+              })
+
+          layer_summaries.append({
+              "layer":         layer_name,
+              "order":         layer_order,
+              "status":        "included",
+              "sub_stages":    sub_stage_summaries,
+              "skipped_repos": skipped_repos,
+          })
+
+      # ── Write YAML ────────────────────────────────────────────────────────────
+      os.makedirs("windows", exist_ok=True)
+      yaml_path = f"windows/proj-auto-{window_label}.yml"
+
+      lines = [
+          f"# proj-auto YAML — window {window} — {manifest_date}",
+          f"# Intra-layer threshold: {threshold_s}s",
+          f"# Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+          f"# Stages: {len(all_stages)}  Jobs: {len(all_jobs)}",
+          "",
+          "stages:",
+      ]
+      for stage in all_stages:
+          lines.append(f"  - {stage}")
+      lines.append("")
+
+      for job_name, job in all_jobs.items():
+          meta = job.pop("_meta", {})
+          lines += [
+              f"# layer: {meta.get('layer')}  sub: {meta.get('sub_stage')}  "
+              f"type: {meta.get('build_type')}  "
+              f"version: {meta.get('publish_version')}  "
+              f"published: {meta.get('publish_time')}",
+              f"{job_name}:",
+              f"  stage: {job['stage']}",
+              f"  trigger:",
+              f"    project: \"{job['trigger']['project']}\"",
+              f"    branch:  \"{job['trigger']['branch']}\"",
+              f"    strategy: depend",
+              f"  variables:",
+              f"  rules:",
+              f"    - when: always",
+              "",
+          ]
+
+      with open(yaml_path, "w") as f:
+          f.write("\n".join(lines))
+
+      # ── Metadata ──────────────────────────────────────────────────────────────
+      meta_path = f"windows/proj-auto-{window_label}-metadata.json"
+      with open(meta_path, "w") as f:
+          json.dump({
+              "window": window, "date": manifest_date,
+              "window_start": window_start.isoformat(),
+              "window_end":   window_end.isoformat(),
+              "intra_layer_threshold_seconds": threshold_s,
+              "total_stages": len(all_stages),
+              "total_jobs":   len(all_jobs),
+              "layers":       layer_summaries,
+          }, f, indent=2)
+
+      with open("proj-auto.env", "w") as f:
+          f.write(f"WINDOW_LABEL={window_label}\n")
+          f.write(f"TOTAL_JOBS={len(all_jobs)}\n")
+          f.write(f"TOTAL_STAGES={len(all_stages)}\n")
+          f.write(f"MANIFEST_DATE={manifest_date}\n")
+
+      print(f"\nWrote {yaml_path}")
+      print(f"  Total stages : {len(all_stages)}")
+      print(f"  Total jobs   : {len(all_jobs)}")
+      PYEOF
+  artifacts:
+    paths:    [windows/]
+    reports:
+      dotenv: proj-auto.env
+    expire_in: 7d
+
+# ── Commit ─────────────────────────────────────────────────────────────────────
+commit-proj-auto-yaml:
+  stage: commit
+  tags: [shell]
+  needs: [generate-layer-yaml]
+  script:
+    - |
+      git remote set-url origin \
+        "https://oauth2:${git_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      git fetch origin "${DEFAULT_BRANCH}"
+      git checkout "${DEFAULT_BRANCH}"
+      git add windows/
+      git diff --cached --quiet && echo "No changes to commit" && exit 0
+      git -c user.email="cicd@internal" -c user.name="CI/CD proj-auto" \
+        commit -m "chore: proj-auto ${WINDOW_LABEL} — ${TOTAL_STAGES} stages, ${TOTAL_JOBS} jobs"
+      git push origin "${DEFAULT_BRANCH}"
+
+# ── Release ─────────────────────────────────────────────────────────────────────
+create-release:
+  stage: release
+  tags: [shell]
+  needs: [commit-proj-auto-yaml]
+  script:
+    - |
+      TAG="proj-auto-${WINDOW_LABEL}"
+
+      curl -fsSL --request POST \
+        --header "PRIVATE-TOKEN: ${git_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data "{\"tag_name\":\"${TAG}\",\"ref\":\"${DEFAULT_BRANCH}\"}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags" || true
+
+      curl -fsSL --request POST \
+        --header "PRIVATE-TOKEN: ${git_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data "{
+          \"name\":        \"proj-auto ${WINDOW_LABEL}\",
+          \"tag_name\":    \"${TAG}\",
+          \"description\": \"Window ${WINDOW} | ${TOTAL_STAGES} stages | ${TOTAL_JOBS} jobs\"
+        }" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
+
+      echo "Release: ${TAG}"
