@@ -1,0 +1,100 @@
+append-entry:
+  stage: append
+  script:
+    - |
+      set -euo pipefail
+
+      DATE=$(date -u +%Y%m%d)
+      MANIFEST_FILE="manifest-${DATE}.json"
+      FILE_PATH="${URL}/repository/${MANIFEST_REPO}/${DATE}/${MANIFEST_FILE}"
+
+      # ── Pull manifest or initialise ─────────────────────────────────────────
+      HTTP_STATUS=$(curl -s -o manifest.json -w "%{http_code}" \
+        -u "${USER}:${PASSWORD}" "${PATH}")
+
+      if [ "${HTTP_STATUS}" = "404" ]; then
+        echo "{\"date\":\"${DATE}\",\"schema_version\":\"1.0\",\"entries\":[]}" \
+          > manifest.json
+        echo "Created new manifest for ${DATE}"
+      elif [ "${HTTP_STATUS}" != "200" ]; then
+        echo "ERROR: returned ${HTTP_STATUS}"
+        exit 1
+      else
+        echo "Pulled manifest: $(python3 -c "
+      import json
+      m = json.load(open('manifest.json'))
+      print(f\"{len(m.get('entries',[]))} existing entries\")
+      ")"
+      fi
+
+      # ── Validate required variables present ─────────────────────────────────
+      for VAR in APPEND_REPO_NAME APPEND_COMMIT_SHA APPEND_REF_BRANCH \
+                 APPEND_PUBLISH_VERSION APPEND_BUILD_TYPE; do
+        if [ -z "${!VAR:-}" ]; then
+          echo "ERROR: Required variable ${VAR} is empty"
+          exit 1
+        fi
+      done
+
+      # ── Append entry (Python handles dedup + JSON safely) ───────────────────
+      python3 - <<PYEOF
+      import json, sys
+      from datetime import datetime, timezone
+
+      with open('manifest.json') as f:
+          manifest = json.load(f)
+
+      repo_name    = "${APPEND_REPO_NAME}"
+      commit_sha   = "${APPEND_COMMIT_SHA}"
+      pub_version  = "${APPEND_PUBLISH_VERSION}"
+
+      # Deduplicate key: (pipeline_id, commit_sha, publish_version)
+      # Same pipeline_id + commit_sha but different publish_version -> keep both
+      # Covers repos publishing multiple artifacts per pipeline (docker multi-arch)
+      pipeline_id = "${APPEND_PIPELINE_ID}"
+      existing = {
+          (e.get('pipeline_id',''), e['commit_sha'], e['publish_version'])
+          for e in manifest['entries']
+      }
+      if (pipeline_id, commit_sha, pub_version) in existing:
+          print(f"Duplicate entry ({repo_name}@{commit_sha[:8]} "
+                f"pipeline={pipeline_id} v{pub_version}) - skipping")
+          sys.exit(0)
+
+      entry = {
+          'repo_name':        repo_name,
+          'project_path':     "${APPEND_PROJECT_PATH}",
+          'commit_sha':       commit_sha,
+          'reference_branch': "${APPEND_REF_BRANCH}",
+          'publish_version':  pub_version,
+          'pipeline_id':      pipeline_id,
+          'publish_time':     datetime.now(timezone.utc).isoformat(timespec='seconds'),
+          'build_type':       "${APPEND_BUILD_TYPE}",
+          'pipeline_url':     "${APPEND_PIPELINE_URL}",
+      }
+
+      manifest['entries'].append(entry)
+      manifest['entry_count'] = len(manifest['entries'])
+      manifest['last_updated'] = entry['publish_time']
+
+      with open('manifest_updated.json', 'w') as f:
+          json.dump(manifest, f, indent=2)
+
+      print(f"Appended: {repo_name} | {commit_sha[:10]} | "
+            f"{pub_version} | {entry['build_type']} | {entry['publish_time']}")
+      PYEOF
+
+      # ── Re-publish if updated ───────────────────────────────────────────────
+      if [ ! -f manifest_updated.json ]; then
+        echo "No update needed (duplicate entry)"
+        exit 0
+      fi
+
+      HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+        -u "${USER}:${PASSWORD}" \
+        -T manifest_updated.json "${PATH}")
+
+      [ "${HTTP_STATUS}" = "201" ] || [ "${HTTP_STATUS}" = "200" ] \
+        || { echo "ERROR: upload returned ${HTTP_STATUS}"; exit 1; }
+
+      echo "Manifest updated"
